@@ -724,11 +724,13 @@ Error HidlComposer::validateDisplay(Display display, nsecs_t /*expectedPresentTi
                                     int32_t /*frameIntervalNs*/, uint32_t* outNumTypes,
                                     uint32_t* outNumRequests) {
     ATRACE_NAME("HwcValidateDisplay");
+    ALOGE("HidlComposer: validateDisplay display=0x%" PRIx64, display);
     mWriter.selectDisplay(display);
     mWriter.validateDisplay();
 
     Error error = execute();
     if (error != Error::NONE) {
+        ALOGE("HidlComposer: validateDisplay FAILED display=0x%" PRIx64 " error=%d", display, (int)error);
         return error;
     }
 
