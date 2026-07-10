@@ -132,12 +132,25 @@ void CFIShadowWriter::Add(uintptr_t begin, uintptr_t end, uintptr_t cfi_check) {
   }
 }
 
+static uintptr_t soinfo_find_symbol(soinfo* si, const char* s);
+
 static soinfo* find_libdl(soinfo* solist) {
   for (soinfo* si = solist; si != nullptr; si = si->next) {
     const char* soname = si->get_soname();
-    if (soname && strcmp(soname, "libdl.so") == 0) {
-      return si;
+    if (soname == nullptr || strcmp(soname, "libdl.so") != 0) {
+      continue;
     }
+    // Under hybris the first libdl entry is a synthetic soinfo built from the
+    // q.so / linker symbol table.  It does not contain __cfi_init.  We need the
+    // real, mapped /system/lib64/libdl.so that is loaded as a dependency.
+    const char* realpath = si->get_realpath();
+    if (realpath == nullptr || strstr(realpath, "/libdl.so") == nullptr) {
+      continue;
+    }
+    if (soinfo_find_symbol(si, "__cfi_init") == 0) {
+      continue;
+    }
+    return si;
   }
   return nullptr;
 }
@@ -214,6 +227,16 @@ bool CFIShadowWriter::NotifyLibDl(soinfo* solist, uintptr_t p) {
 bool CFIShadowWriter::MaybeInit(soinfo* new_si, soinfo* solist) {
   CHECK(initial_link_done);
   CHECK(shadow_start == nullptr);
+#ifdef HYBRIS_BUILD
+  // Hybris loads Android ELF libraries into glibc processes. The CFI shadow
+  // init path assumes libdl.so is part of the initial link and has a writable
+  // .bss page; under hybris it is loaded later and its .bss ends up read-only,
+  // causing __cfi_init to SIGSEGV. The slowpath is already neutralised in
+  // libdl_cfi.cpp, so skip shadow setup entirely.
+  (void)new_si;
+  (void)solist;
+  return true;
+#endif
   // Check if CFI shadow must be initialized at this time.
   bool found = false;
   if (new_si == nullptr) {
@@ -248,8 +271,14 @@ bool CFIShadowWriter::MaybeInit(soinfo* new_si, soinfo* solist) {
 
 bool CFIShadowWriter::AfterLoad(soinfo* si, soinfo* solist) {
   if (!initial_link_done) {
-    // Too early.
-    return true;
+    // In normal Android this is false only until linker_main() calls
+    // InitialLinkDone() after the initial set of libraries is loaded.  In
+    // hybris mode there is no linker_main() call, so we lazily initialize the
+    // shadow the first time a CFI-enabled DSO is loaded.
+    if (soinfo_find_cfi_check(si) == 0) {
+      return true;
+    }
+    return InitialLinkDone(solist);
   }
 
   if (shadow_start == nullptr) {
