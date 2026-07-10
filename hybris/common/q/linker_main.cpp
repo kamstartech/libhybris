@@ -34,6 +34,9 @@
 #include <sys/auxv.h>
 #include <sys/cdefs-android.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
 
 #include "linker_debug.h"
 #include "linker_cfi.h"
@@ -77,6 +80,12 @@ static ElfW(Addr) get_elf_exec_load_bias(const ElfW(Ehdr)* elf);
 
 static void get_elf_base_from_phdr(const ElfW(Phdr)* phdr_table, size_t phdr_count,
                                    ElfW(Addr)* base, ElfW(Addr)* load_bias);
+
+/* Earliest q.so trace — fires at INIT_ARRAY time (before android_linker_init) */
+__attribute__((constructor))
+static void q_so_loaded(void) {
+  HYBRIS_WRITE_DEBUG_LOG("=== q.so constructor ===\n");
+}
 
 // These should be preserved static to avoid emitting
 // RELATIVE relocations for the part of the code running
@@ -732,23 +741,82 @@ __linker_init_post_relocation(KernelArgumentBlock& args, soinfo& tmp_linker_so) 
 #endif
 
 
+// Host ELF info passed from glibc side (hooks.c) via android_linker_set_host_info().
+// These describe the shared library that contains q.so (libhybris-common.so).
+static ElfW(Addr) g_host_elf_base = 0;
+static const ElfW(Phdr)* g_host_elf_phdr = nullptr;
+static ElfW(Half) g_host_elf_phnum = 0;
+static ElfW(Addr) g_host_elf_load_bias = 0;
+
+extern "C" void android_linker_set_host_info(ElfW(Addr) base,
+                                             const ElfW(Phdr)* phdr,
+                                             ElfW(Half) phnum,
+                                             ElfW(Addr) load_bias) {
+  g_host_elf_base = base;
+  g_host_elf_phdr = phdr;
+  g_host_elf_phnum = phnum;
+  g_host_elf_load_bias = load_bias;
+  HYBRIS_WRITE_DEBUG_LOG("q.so: set_host_info base=%p phdr=%p phnum=%d bias=%p\n",
+          (void*)base, (const void*)phdr, (int)phnum, (void*)load_bias);
+}
+
 static void generate_tmpsoinfo(soinfo& tmp_linker_so) {
-  tmp_linker_so.base = (ElfW(Addr))nullptr;
+  HYBRIS_WRITE_DEBUG_LOG("q.so: generate_tmpsoinfo entered, g_host_elf_phdr=%p phnum=%d\n",
+          (const void*)g_host_elf_phdr, (int)g_host_elf_phnum);
+
+  // Set public fields to safe defaults (private fields are set by prelink_image
+  // or already initialized by the soinfo constructor).
+  tmp_linker_so.base = 0;
   tmp_linker_so.size = 0;
   tmp_linker_so.load_bias = 0;
   tmp_linker_so.dynamic = nullptr;
   tmp_linker_so.phdr = nullptr;
   tmp_linker_so.phnum = 0;
+
+  if (g_host_elf_phdr != nullptr && g_host_elf_phnum > 0) {
+    tmp_linker_so.base = g_host_elf_base;
+    tmp_linker_so.size = phdr_table_get_load_size(g_host_elf_phdr, g_host_elf_phnum);
+    // CRITICAL: set load_bias=0 because glibc has already relocated d_ptr entries in the
+    // dynamic section to absolute addresses when loading q.so via dlopen. If we pass
+    // g_host_elf_load_bias, prelink_image would add it again → overflow → SIGSEGV at DT_HASH.
+    // We pre-compute the dynamic section pointer here using the real load_bias so
+    // phdr_table_get_dynamic_section can find PT_DYNAMIC, then let prelink_image skip that
+    // step (it checks if dynamic != nullptr).
+    tmp_linker_so.load_bias = 0;
+    tmp_linker_so.phdr = g_host_elf_phdr;
+    tmp_linker_so.phnum = g_host_elf_phnum;
+    // Pre-locate the dynamic section with the real load_bias (phdr p_vaddr are relative).
+    {
+      ElfW(Word) dyn_flags = 0;
+      phdr_table_get_dynamic_section(g_host_elf_phdr, g_host_elf_phnum, g_host_elf_load_bias,
+                                     &tmp_linker_so.dynamic, &dyn_flags);
+    }
+    tmp_linker_so.set_linker_flag();
+
+    if (tmp_linker_so.prelink_image()) {
+      HYBRIS_WRITE_DEBUG_LOG("q.so: prelink_image OK — base=%p size=%lx bias=%p\n",
+              (void*)tmp_linker_so.base, (unsigned long)tmp_linker_so.size,
+              (void*)tmp_linker_so.load_bias);
+      INFO("q.so soinfo populated from host ELF (base=%p, bias=%p)",
+           reinterpret_cast<void*>(tmp_linker_so.base),
+           reinterpret_cast<void*>(tmp_linker_so.load_bias));
+    } else {
+      HYBRIS_WRITE_DEBUG_LOG("q.so: prelink_image FAILED\n");
+      DL_WARN("prelink_image failed for host ELF — symbols will be invisible");
+      tmp_linker_so.base = 0;
+      tmp_linker_so.size = 0;
+      tmp_linker_so.load_bias = 0;
+      tmp_linker_so.dynamic = nullptr;
+      tmp_linker_so.phdr = nullptr;
+      tmp_linker_so.phnum = 0;
+    }
+  } else {
+    HYBRIS_WRITE_DEBUG_LOG("q.so: NO host ELF info — null soinfo fallback\n");
+    DL_WARN("No host ELF info — q.so soinfo will have null symbol tables");
+  }
+
   tmp_linker_so.set_linker_flag();
-
-  DEBUG("tmp_linker_so's load_bias=%p \n", tmp_linker_so.load_bias);
-
-  // Prelink the linker so we can access linker globals.
-//  if (!tmp_linker_so.prelink_image()) {
-//    PRINT("can't prelink self:ret\n");
-//  };
-
-  //tmp_linker_so.call_constructors();
+  DEBUG("tmp_linker_so's load_bias=%p", reinterpret_cast<void*>(tmp_linker_so.load_bias));
 }
 
 static const char* get_executable_path() {
@@ -824,6 +892,10 @@ extern "C" void android_linker_init(int sdk_version, void* (*get_hooked_symbol)(
   generate_tmpsoinfo(tmp_linker_so);
 
   sonext = solist = get_libdl_info(kLinkerPath, tmp_linker_so);
+  // Register in default namespace so symbol lookups can find q.so's symbols.
+  g_default_namespace->add_soinfo(solist);
+
+  HYBRIS_WRITE_DEBUG_LOG("q.so: linker_init solist=%p, calling add_vdso\n", (void*)solist);
 
   add_vdso();
   //init_link_map_head(tmp_linker_so, kLinkerPath);
@@ -832,5 +904,7 @@ extern "C" void android_linker_init(int sdk_version, void* (*get_hooked_symbol)(
   DEBUG("sdk_version %d\n", sdk_version);
 
   init_default_namespaces(get_executable_path());
+
+  HYBRIS_WRITE_DEBUG_LOG("q.so: android_linker_init COMPLETE\n");
   DEBUG("init_default_namespaces %d\n", sdk_version);
 }

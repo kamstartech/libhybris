@@ -30,9 +30,29 @@
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+static void hybris_probe_s(const char* fmt, ...) {
+#if defined(HYBRIS_DEBUG_LOG)
+  char buf[256];
+  int prefix = snprintf(buf, sizeof(buf), "[pid=%d] ", (int)getpid());
+  if (prefix < 0 || prefix >= (int)sizeof(buf)) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf + prefix, sizeof(buf) - prefix, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  int total = prefix + n;
+  if (total >= (int)sizeof(buf)) total = sizeof(buf) - 1;
+  int fd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+  if (fd >= 0) { write(fd, buf, total); fsync(fd); close(fd); }
+#endif
+}
 
 #include <android/api-level.h>
 
@@ -441,19 +461,43 @@ extern "C" void* android_dlsym(void* handle, const char* symbol);
 void (*bionic___system_properties_init)(void) = NULL;
 
 void soinfo::call_constructors() {
+  hybris_probe_s("call_constructors ENTRY realpath=%s soname=%s called=%d\n",
+                 realpath_.c_str(), soname_ ? soname_ : "(null)",
+                 (int)constructors_called);
   if (constructors_called) {
     return;
   }
 
   if (soname_ != nullptr && strcmp(soname_, "libc.so") == 0) {
     DEBUG("HYBRIS: =============> Skipping libc.so (but initializing properties)\n");
+    hybris_probe_s("call_constructors: libc.so special path, calling __system_properties_init\n");
     bionic___system_properties_init = (void(*)())android_dlsym(this, "__system_properties_init");
     if (!bionic___system_properties_init) {
         fprintf(stderr, "Could not initialize android system properties!\n");
         abort();
     }
     bionic___system_properties_init();
+    hybris_probe_s("call_constructors: libc.so properties_init DONE\n");
     constructors_called = true;
+    return;
+  }
+
+  // Mirror the libc.so skip for libc++.so. In a libhybris context, bionic
+  // libc is only partially initialized (see the libc.so special path above --
+  // host glibc is live, Android libc's DT_INIT_ARRAY is not run). Running
+  // libc++.so's global constructors (e.g. ios_base::Init which sets up
+  // std::cin/std::cout/std::cerr through bionic __sF) then dereferences
+  // uninitialized bionic state and SEGVs. HAL code paths don't rely on
+  // libc++ globals, so skipping these init_array entries is safe.
+  if (soname_ != nullptr && strcmp(soname_, "libc++.so") == 0) {
+    DEBUG("HYBRIS: =============> Skipping libc++.so DT_INIT_ARRAY (uninitialized bionic state)\n");
+    hybris_probe_s("call_constructors: libc++.so special path, skipping DT_INIT_ARRAY\n");
+    // Still recurse into children so their constructors run.
+    constructors_called = true;
+    get_children().for_each([] (soinfo* si) {
+      si->call_constructors();
+    });
+    hybris_probe_s("call_constructors: libc++.so children DONE, returning\n");
     return;
   }
 
@@ -478,13 +522,20 @@ void soinfo::call_constructors() {
     si->call_constructors();
   });
 
+  hybris_probe_s("call_constructors: children DONE realpath=%s\n", realpath_.c_str());
+
   if (!is_linker()) {
     bionic_trace_begin((std::string("calling constructors: ") + get_realpath()).c_str());
   }
 
   // DT_INIT should be called before DT_INIT_ARRAY if both are present.
+  hybris_probe_s("call_constructors: DT_INIT realpath=%s func=%p\n",
+                 realpath_.c_str(), (void*)init_func_);
   call_function("DT_INIT", init_func_, get_realpath());
+  hybris_probe_s("call_constructors: DT_INIT_ARRAY realpath=%s count=%zu\n",
+                 realpath_.c_str(), init_array_count_);
   call_array("DT_INIT_ARRAY", init_array_, init_array_count_, false, get_realpath());
+  hybris_probe_s("call_constructors: init DONE realpath=%s\n", realpath_.c_str());
 
   if (!is_linker()) {
     bionic_trace_end();
@@ -492,7 +543,8 @@ void soinfo::call_constructors() {
 }
 
 void soinfo::call_destructors() {
-  if (!constructors_called  || (soname_ != nullptr && (strcmp(soname_, "libc.so") == 0))) {
+  if (!constructors_called  || (soname_ != nullptr && (strcmp(soname_, "libc.so") == 0 ||
+                                                       strcmp(soname_, "libc++.so") == 0))) {
     return;
   }
 

@@ -32,17 +32,38 @@
 #include "linker_dlwarning.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <android/api-level.h>
 
 #include <bionic/pthread_internal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
 #include "private/bionic_globals.h"
 #include "private/bionic_tls.h"
 #include "private/ScopedPthreadMutexLocker.h"
 
 #define __LINKER_PUBLIC__ __attribute__((visibility("default")))
+
+static void hybris_probe(const char* fmt, ...) {
+#if defined(HYBRIS_DEBUG_LOG)
+  char buf[256];
+  int prefix = snprintf(buf, sizeof(buf), "[pid=%d] ", (int)getpid());
+  if (prefix < 0 || prefix >= (int)sizeof(buf)) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf + prefix, sizeof(buf) - prefix, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  int total = prefix + n;
+  if (total >= (int)sizeof(buf)) total = sizeof(buf) - 1;
+  int fd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+  if (fd >= 0) { write(fd, buf, total); fsync(fd); close(fd); }
+#endif
+}
 
 extern "C" {
 
@@ -146,13 +167,19 @@ static void* dlopen_ext(const char* filename,
                         int flags,
                         const android_dlextinfo* extinfo,
                         const void* caller_addr) {
+  hybris_probe("dlopen_ext START name=%s flags=0x%x extinfo=%p\n",
+               filename ? filename : "(null)", flags, extinfo);
   ScopedPthreadMutexLocker locker(&g_dl_mutex);
+  hybris_probe("dlopen_ext LOCKED, calling do_dlopen\n");
   g_linker_logger.ResetState();
   void* result = do_dlopen(filename, flags, extinfo, caller_addr);
+  hybris_probe("dlopen_ext AFTER do_dlopen result=%p\n", result);
   if (result == nullptr) {
     __bionic_format_dlerror("dlopen failed", linker_get_error_buffer());
+    hybris_probe("dlopen_ext FAILED name=%s\n", filename ? filename : "(null)");
     return nullptr;
   }
+  hybris_probe("dlopen_ext OK name=%s result=%p\n", filename ? filename : "(null)", result);
   return result;
 }
 

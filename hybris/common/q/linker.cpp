@@ -81,6 +81,24 @@
 #include "../wrappers.h"
 #endif
 
+#include <stdarg.h>
+static void hybris_probe(const char* fmt, ...) {
+#if defined(HYBRIS_DEBUG_LOG)
+  char buf[384];
+  int prefix = snprintf(buf, sizeof(buf), "[pid=%d] ", (int)getpid());
+  if (prefix < 0 || prefix >= (int)sizeof(buf)) return;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf + prefix, sizeof(buf) - prefix, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  int total = prefix + n;
+  if (total >= (int)sizeof(buf)) total = sizeof(buf) - 1;
+  int fd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+  if (fd >= 0) { write(fd, buf, total); fsync(fd); close(fd); }
+#endif
+}
+
 #define TMPFS_MAGIC 0x01021994
 
 #define DF_1_PIE        0x08000000
@@ -1134,6 +1152,14 @@ static int open_library_on_paths(ZipArchiveCache* zip_archive_cache,
                                  const std::vector<std::string>& paths,
                                  std::string* realpath) {
   for (const auto& path : paths) {
+    // In Android Q+ the bootstrap libdl.so is a stub that lacks CFI helpers
+    // such as __cfi_init.  When running under hybris we must load the real
+    // /system/lib64/libdl.so, otherwise CFI shadow initialization fails.
+    if (strcmp(name, "libdl.so") == 0 &&
+        path.size() >= 10 && path.rfind("/bootstrap") == path.size() - 10) {
+      continue;
+    }
+
     char buf[512];
     if (!format_path(buf, sizeof(buf), path.c_str(), name)) {
       continue;
@@ -1798,13 +1824,18 @@ bool find_libraries(android_namespace_t* ns,
   }
 
   // Step 3: pre-link all DT_NEEDED libraries in breadth first order.
+  hybris_probe("find_libraries: STEP 3 prelink load_tasks size=%zu\n", load_tasks.size());
   for (auto&& task : load_tasks) {
     soinfo* si = task->get_soinfo();
+    hybris_probe("find_libraries: prelink task realpath=%s is_linked=%d\n",
+                 si->get_realpath(), (int)si->is_linked());
     if (!si->is_linked() && !si->prelink_image()) {
+      hybris_probe("find_libraries: prelink FAILED realpath=%s\n", si->get_realpath());
       return false;
     }
     register_soinfo_tls(si);
   }
+  hybris_probe("find_libraries: STEP 3 DONE\n");
 
   // Step 4: Construct the global group. Note: DF_1_GLOBAL bit of a library is
   // determined at step 3.
@@ -1908,10 +1939,13 @@ bool find_libraries(android_namespace_t* ns,
           // flag is set.
           link_extinfo = extinfo;
         }
+        hybris_probe("find_libraries: STEP 6 link_image start realpath=%s\n", si->get_realpath());
         if (!si->link_image(global_group, local_group, link_extinfo, &relro_fd_offset) ||
             !get_cfi_shadow()->AfterLoad(si, solist_get_head())) {
+          hybris_probe("find_libraries: STEP 6 link_image FAILED realpath=%s\n", si->get_realpath());
           return false;
         }
+        hybris_probe("find_libraries: STEP 6 link_image OK realpath=%s\n", si->get_realpath());
       }
 
       return true;
@@ -2306,7 +2340,12 @@ void* do_dlopen(const char* name, int flags,
   }
 
   ProtectedDataGuard guard;
+  hybris_probe("do_dlopen: calling find_library name=%s ns=%s\n",
+               translated_name ? translated_name : "(null)",
+               ns == nullptr ? "(null)" : ns->get_name());
   soinfo* si = find_library(ns, translated_name, flags, extinfo, caller);
+  hybris_probe("do_dlopen: find_library returned si=%p name=%s\n",
+               si, translated_name ? translated_name : "(null)");
   loading_trace.End();
 
   if (si != nullptr) {
@@ -2314,7 +2353,11 @@ void* do_dlopen(const char* name, int flags,
     LD_LOG(kLogDlopen,
            "... dlopen calling constructors: realpath=\"%s\", soname=\"%s\", handle=%p",
            si->get_realpath(), si->get_soname(), handle);
+    hybris_probe("do_dlopen: calling constructors realpath=%s handle=%p\n",
+                 si->get_realpath(), handle);
     si->call_constructors();
+    hybris_probe("do_dlopen: constructors DONE realpath=%s handle=%p\n",
+                 si->get_realpath(), handle);
     failure_guard.Disable();
     LD_LOG(kLogDlopen,
            "... dlopen successful: realpath=\"%s\", soname=\"%s\", handle=%p",
@@ -2322,6 +2365,8 @@ void* do_dlopen(const char* name, int flags,
     return handle;
   }
 
+  hybris_probe("do_dlopen: returning nullptr name=%s\n",
+               translated_name ? translated_name : "(null)");
   return nullptr;
 }
 
@@ -3465,7 +3510,21 @@ static soinfo_list_t g_empty_list;
 bool soinfo::prelink_image() {
   /* Extract dynamic section */
   ElfW(Word) dynamic_flags = 0;
-  phdr_table_get_dynamic_section(phdr, phnum, load_bias, &dynamic, &dynamic_flags);
+
+  hybris_probe("prelink_image ENTRY realpath=%s soname=%s bias=%p phnum=%zu\n",
+               realpath_.c_str(), soname_ ? soname_ : "(null)",
+               (void*)load_bias, (size_t)phnum);
+
+  HYBRIS_WRITE_DEBUG_LOG("prelink: A - dynamic pre-set=%d bias=%p\n", (dynamic != nullptr), (void*)load_bias);
+
+  // Only call phdr_table_get_dynamic_section if dynamic hasn't been pre-set.
+  // generate_tmpsoinfo() pre-sets dynamic using the real load_bias, then sets
+  // load_bias=0 so prelink_image doesn't double-add it to already-absolute d_ptr values.
+  if (dynamic == nullptr) {
+    phdr_table_get_dynamic_section(phdr, phnum, load_bias, &dynamic, &dynamic_flags);
+  }
+
+  HYBRIS_WRITE_DEBUG_LOG("prelink: B - dynamic=%p bias=%p relocating=%d\n", dynamic, (void*)load_bias, (int)((flags_ & FLAG_LINKER) != 0));
 
   /* We can't log anything until the linker is relocated */
   bool relocating_linker = (flags_ & FLAG_LINKER) != 0;
@@ -3490,8 +3549,11 @@ bool soinfo::prelink_image() {
                                   &ARM_exidx, &ARM_exidx_count);
 #endif
 
+  HYBRIS_WRITE_DEBUG_LOG("prelink: C - calling __bionic_get_tls_segment\n");
+
   TlsSegment tls_segment;
   if (__bionic_get_tls_segment(phdr, phnum, load_bias, &tls_segment)) {
+      HYBRIS_WRITE_DEBUG_LOG("prelink: D - TLS found align=%zu, calling new soinfo_tls\n", tls_segment.alignment);
     if (!__bionic_check_tls_alignment(&tls_segment.alignment)) {
       if (!relocating_linker) {
         DL_ERR("TLS segment alignment in \"%s\" is not a power of 2: %zu",
@@ -3501,7 +3563,12 @@ bool soinfo::prelink_image() {
     }
     tls_ = std::unique_ptr<soinfo_tls>(new soinfo_tls());
     tls_->segment = tls_segment;
+      HYBRIS_WRITE_DEBUG_LOG("prelink: E - new soinfo_tls OK\n");
+  } else {
+    HYBRIS_WRITE_DEBUG_LOG("prelink: C2 - no TLS segment\n");
   }
+
+  HYBRIS_WRITE_DEBUG_LOG("prelink: F - entering DT_* loop\n");
 
   // Extract useful information from dynamic section.
   // Note that: "Except for the DT_NULL element at the end of the array,
@@ -3510,6 +3577,7 @@ bool soinfo::prelink_image() {
   // source: http://www.sco.com/developers/gabi/1998-04-29/ch5.dynamic.html
   uint32_t needed_count = 0;
   for (ElfW(Dyn)* d = dynamic; d->d_tag != DT_NULL; ++d) {
+    HYBRIS_WRITE_DEBUG_LOG("DT: 0x%lx val=0x%lx\n", (long)d->d_tag, (long)d->d_un.d_val);
     DEBUG("d = %p, d[0](tag) = %p d[1](val) = %p",
           d, reinterpret_cast<void*>(d->d_tag), reinterpret_cast<void*>(d->d_un.d_val));
     switch (d->d_tag) {
@@ -3949,6 +4017,9 @@ bool soinfo::prelink_image() {
     }
   }
 
+  hybris_probe("prelink_image DT_LOOP_DONE realpath=%s soname=%s\n",
+               realpath_.c_str(), soname_ ? soname_ : "(null)");
+
   // Before M release linker was using basename in place of soname.
   // In the case when dt_soname is absent some apps stop working
   // because they can't find dt_needed library by soname.
@@ -3968,11 +4039,14 @@ bool soinfo::prelink_image() {
 
     // Don't call add_dlwarning because a missing DT_SONAME isn't important enough to show in the UI
   }
+  hybris_probe("prelink_image OK realpath=%s\n", realpath_.c_str());
   return true;
 }
 
 bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& local_group,
                         const android_dlextinfo* extinfo, size_t* relro_fd_offset) {
+  hybris_probe("link_image ENTRY realpath=%s is_linked=%d\n",
+               realpath_.c_str(), (int)is_image_linked());
   if (is_image_linked()) {
     // already linked.
     return true;
@@ -3987,11 +4061,14 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
     target_sdk_version_ = get_application_target_sdk_version();
   }
 
+  hybris_probe("link_image: calling VersionTracker::init realpath=%s\n", realpath_.c_str());
   VersionTracker version_tracker;
 
   if (!version_tracker.init(this)) {
+    hybris_probe("link_image: VersionTracker::init FAILED realpath=%s\n", realpath_.c_str());
     return false;
   }
+  hybris_probe("link_image: VersionTracker OK, entering relocation realpath=%s\n", realpath_.c_str());
 
 #if !defined(__LP64__)
   if (has_text_relocations) {
@@ -4025,6 +4102,8 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
         android_relocs_[2] == 'S' &&
         android_relocs_[3] == '2') {
       DEBUG("[ android relocating %s ]", get_realpath());
+      hybris_probe("link_image: relocate APS2 START realpath=%s size=%zu\n",
+                   realpath_.c_str(), android_relocs_size_);
 
       bool relocated = false;
       const uint8_t* packed_relocs = android_relocs_ + 4;
@@ -4036,6 +4115,8 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
             sleb128_decoder(packed_relocs, packed_relocs_size)),
           global_group, local_group);
 
+      hybris_probe("link_image: relocate APS2 DONE realpath=%s ok=%d\n",
+                   realpath_.c_str(), (int)relocated);
       if (!relocated) {
         return false;
       }
@@ -4047,25 +4128,33 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
 
   if (relr_ != nullptr) {
     DEBUG("[ relocating %s relr ]", get_realpath());
+    hybris_probe("link_image: relocate RELR START realpath=%s\n", realpath_.c_str());
     if (!relocate_relr()) {
       return false;
     }
+    hybris_probe("link_image: relocate RELR DONE realpath=%s\n", realpath_.c_str());
   }
 
 #if defined(USE_RELA)
   if (rela_ != nullptr) {
     DEBUG("[ relocating %s rela ]", get_realpath());
+    hybris_probe("link_image: relocate RELA START realpath=%s count=%zu\n",
+                 realpath_.c_str(), rela_count_);
     if (!relocate(version_tracker,
             plain_reloc_iterator(rela_, rela_count_), global_group, local_group)) {
       return false;
     }
+    hybris_probe("link_image: relocate RELA DONE realpath=%s\n", realpath_.c_str());
   }
   if (plt_rela_ != nullptr) {
     DEBUG("[ relocating %s plt rela ]", get_realpath());
+    hybris_probe("link_image: relocate PLT_RELA START realpath=%s count=%zu\n",
+                 realpath_.c_str(), plt_rela_count_);
     if (!relocate(version_tracker,
             plain_reloc_iterator(plt_rela_, plt_rela_count_), global_group, local_group)) {
       return false;
     }
+    hybris_probe("link_image: relocate PLT_RELA DONE realpath=%s\n", realpath_.c_str());
   }
 #else
   if (rel_ != nullptr) {
@@ -4128,6 +4217,7 @@ bool soinfo::link_image(const soinfo_list_t& global_group, const soinfo_list_t& 
 
   notify_gdb_of_load(this);
   set_image_linked();
+  hybris_probe("link_image OK realpath=%s\n", realpath_.c_str());
   return true;
 }
 

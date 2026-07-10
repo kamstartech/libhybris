@@ -34,6 +34,8 @@
 #include <inttypes.h>
 #include <strings.h>
 #include <dlfcn.h>
+#include <link.h>
+#include <elf.h>
 #include <pthread.h>
 #include <sys/xattr.h>
 #include <grp.h>
@@ -53,6 +55,23 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <fcntl.h>
+
+// Hybris debug logging helper. Compile with -DHYBRIS_DEBUG_LOG to enable
+// synchronous writes to /data/hybris-debug.log. Off by default because the
+// unconditional fsync is catastrophically slow for processes that load many
+// libraries (e.g. gmp-generate-info on SailfishOS).
+#if defined(HYBRIS_DEBUG_LOG)
+#define HYBRIS_WRITE_DEBUG_LOG(...) do { \
+    int _dbg_fd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644); \
+    if (_dbg_fd >= 0) { \
+      dprintf(_dbg_fd, __VA_ARGS__); \
+      fsync(_dbg_fd); \
+      close(_dbg_fd); \
+    } \
+  } while (0)
+#else
+#define HYBRIS_WRITE_DEBUG_LOG(...) do { } while (0)
+#endif
 
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -95,6 +114,13 @@ static locale_t hybris_locale;
 static int locale_inited = 0;
 static hybris_hook_cb hook_callback = NULL;
 
+/* Earliest possible trace: fires when libhybris-common.so is mapped by glibc.
+ * Write to /data/ (Android userdata, bind-mounted in SFOS, survives reboot). */
+static void __attribute__((constructor)) hybris_common_loaded(void)
+{
+    HYBRIS_WRITE_DEBUG_LOG("=== libhybris-common loaded ===\n");
+}
+
 #ifdef WANT_ARM_TRACING
 static void (*_android_linker_init)(int sdk_version, void* (*get_hooked_symbol)(const char*, const char*), int enable_linker_gdb_support, void *(_create_wrapper)(const char*, void*, int), int wrapping_enabled) = NULL;
 #else
@@ -128,6 +154,10 @@ void *(*_android_get_exported_namespace)(const char* name) = NULL;
 
 #if WANT_LINKER_Q
 void * (*_android_shared_globals)() = NULL;
+static void (*_android_linker_set_host_info)(ElfW(Addr) base,
+                                             const ElfW(Phdr)* phdr,
+                                             ElfW(Half) phnum,
+                                             ElfW(Addr) load_bias) = NULL;
 #endif
 
 /* TODO:
@@ -3673,7 +3703,12 @@ static void __hybris_linker_init()
 
     LOGD("Loading linker from %s..", path);
 
+    HYBRIS_WRITE_DEBUG_LOG("hooks.c: dlopen(q.so) starting PID=%d\n", (int)getpid());
+
     linker_handle = __hybris_load_linker(path);
+
+    HYBRIS_WRITE_DEBUG_LOG("hooks.c: dlopen(q.so) returned %p\n", linker_handle);
+
     if (!linker_handle)
         exit(1);
 
@@ -3698,6 +3733,65 @@ static void __hybris_linker_init()
     _android_get_exported_namespace = dlsym(linker_handle, "android_get_exported_namespace");
 #if WANT_LINKER_Q
     _android_shared_globals = dlsym(linker_handle, "android_shared_globals");
+    _android_linker_set_host_info = dlsym(linker_handle, "android_linker_set_host_info");
+
+    /* Debug trace — persistent path survives reboot */
+#if defined(HYBRIS_DEBUG_LOG)
+    {
+        int dbgfd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (dbgfd >= 0) {
+            dprintf(dbgfd, "\n=== hooks.c PID=%d ===\n", getpid());
+            dprintf(dbgfd, "set_host_info=%p linker_init=%p dlopen=%p\n",
+                    _android_linker_set_host_info, _android_linker_init, _android_dlopen);
+        }
+
+        /* Pass host ELF info to q.so so it can build a real soinfo with symbol
+         * tables. Without this, Android 15's ld-android.so trap stubs get called
+         * instead of q.so's __loader_* implementations → SIGSEGV. */
+        if (_android_linker_set_host_info && _android_linker_init) {
+            Dl_info dli;
+            if (dladdr((void*)_android_linker_init, &dli) && dli.dli_fbase) {
+                ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)dli.dli_fbase;
+                if (ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
+                    ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+                    ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
+                    ehdr->e_ident[EI_MAG3] == ELFMAG3) {
+                    ElfW(Phdr)* phdr = (ElfW(Phdr)*)((uintptr_t)ehdr + ehdr->e_phoff);
+                    ElfW(Half) phnum = ehdr->e_phnum;
+                    ElfW(Addr) base = (ElfW(Addr))ehdr;
+                    ElfW(Addr) load_bias = 0;
+                    for (int i = 0; i < phnum; i++) {
+                        if (phdr[i].p_type == PT_LOAD) {
+                            load_bias = (ElfW(Addr))ehdr + phdr[i].p_offset - phdr[i].p_vaddr;
+                            break;
+                        }
+                    }
+                    if (dbgfd >= 0) {
+                        dprintf(dbgfd, "calling set_host_info base=%p phnum=%d bias=%p\n",
+                                (void*)base, phnum, (void*)load_bias);
+                    }
+                    _android_linker_set_host_info(base, phdr, phnum, load_bias);
+                    if (dbgfd >= 0)
+                        dprintf(dbgfd, "set_host_info OK\n");
+                } else {
+                    if (dbgfd >= 0)
+                        dprintf(dbgfd, "ERROR: dli_fbase not valid ELF\n");
+                }
+            } else {
+                if (dbgfd >= 0)
+                    dprintf(dbgfd, "ERROR: dladdr failed\n");
+            }
+        } else {
+            if (dbgfd >= 0)
+                dprintf(dbgfd, "SKIP: set_host_info=%p init=%p\n",
+                        _android_linker_set_host_info, _android_linker_init);
+        }
+        if (dbgfd >= 0) {
+            dprintf(dbgfd, "about to call _android_linker_init sdk=%d\n", sdk_version);
+            fsync(dbgfd);
+            close(dbgfd);
+        }
+    }
 #endif
     /* Now its time to setup the linker itself */
 #ifdef WANT_ARM_TRACING
@@ -3705,6 +3799,8 @@ static void __hybris_linker_init()
 #else
     _android_linker_init(sdk_version, __hybris_get_hooked_symbol, enable_linker_gdb_support);
 #endif
+
+    HYBRIS_WRITE_DEBUG_LOG("linker_init RETURNED OK pid=%d\n", getpid());
 
     if (_android_set_application_target_sdk_version) {
         _android_set_application_target_sdk_version(sdk_version);
@@ -3728,6 +3824,9 @@ void* android_dlopen(const char* filename, int flag)
     if (!_android_dlopen) {
         return NULL;
     }
+
+    HYBRIS_WRITE_DEBUG_LOG("android_dlopen(%s, %d) pid=%d\n",
+            filename ? filename : "NULL", flag, getpid());
 
     return _android_dlopen(filename, flag);
 }

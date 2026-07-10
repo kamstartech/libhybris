@@ -28,6 +28,26 @@
 
 #pragma once
 
+// Hybris debug logging helper. Compile with -DHYBRIS_DEBUG_LOG to enable
+// synchronous writes to /data/hybris-debug.log. Off by default because the
+// unconditional fsync is catastrophically slow for processes that load many
+// libraries (e.g. gmp-generate-info on SailfishOS).
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+#if defined(HYBRIS_DEBUG_LOG)
+#define HYBRIS_WRITE_DEBUG_LOG(...) do { \
+    int _dbg_fd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644); \
+    if (_dbg_fd >= 0) { \
+      dprintf(_dbg_fd, __VA_ARGS__); \
+      fsync(_dbg_fd); \
+      close(_dbg_fd); \
+    } \
+  } while (0)
+#else
+#define HYBRIS_WRITE_DEBUG_LOG(...) do { } while (0)
+#endif
+
 // You can increase the verbosity of debug traces by defining the LD_DEBUG
 // environment variable to a numeric value from 0 to 2 (corresponding to
 // INFO, TRACE, and DEBUG calls in the source). This will only
