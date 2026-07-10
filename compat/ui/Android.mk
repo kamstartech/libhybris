@@ -1,4 +1,5 @@
 LOCAL_PATH:= $(call my-dir)
+ifeq (,$(wildcard external/libhybris/Android.mk))
 include $(CLEAR_VARS)
 include $(LOCAL_PATH)/../Android.common.mk
 
@@ -30,3 +31,4 @@ endif
 include $(BUILD_SHARED_LIBRARY)
 
 include $(CLEAR_VARS)
+endif

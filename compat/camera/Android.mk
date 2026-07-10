@@ -1,5 +1,7 @@
 LOCAL_PATH:= $(call my-dir)
 
+ifeq (,$(wildcard external/libhybris/Android.mk))
+
 ifneq (,$(wildcard frameworks/av/media/mediaserver/Android.mk))
 HYBRIS_MEDIA_32_BIT_ONLY := $(shell cat frameworks/av/media/mediaserver/Android.mk | grep LOCAL_32_BIT_ONLY | grep -o "true\|false")
 else
@@ -96,3 +98,5 @@ LOCAL_MULTILIB := 32
 endif
 
 include $(BUILD_EXECUTABLE)
+
+endif

@@ -16,6 +16,8 @@ endif
 
 LOCAL_PATH:= $(call my-dir)
 
+ifeq (,$(wildcard external/libhybris/Android.mk))
+
 include $(CLEAR_VARS)
 LOCAL_MODULE := libhwc2_compat_layer
 LOCAL_SRC_FILES := HWC2.cpp HidlComposerHal.cpp ComposerHal.cpp hwc2_compatibility_layer.cpp
@@ -188,3 +190,4 @@ LOCAL_CFLAGS += \
 	-DANDROID_VERSION_PATCH=$(ANDROID_VERSION_PATCH)
 
 include $(BUILD_EXECUTABLE)
+endif

@@ -52,7 +52,7 @@ void sync_file_info_free(struct sync_file_info* info);
 #include <errno.h>
 #include <linux/types.h>
 #include <poll.h>
-#include <../common/n/bionic/libc/include/stdatomic.h>
+#include <stdatomic.h>
 
 enum uapi_version {
     UAPI_UNKNOWN,
