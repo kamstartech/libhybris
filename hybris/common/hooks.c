@@ -3735,63 +3735,46 @@ static void __hybris_linker_init()
     _android_shared_globals = dlsym(linker_handle, "android_shared_globals");
     _android_linker_set_host_info = dlsym(linker_handle, "android_linker_set_host_info");
 
-    /* Debug trace — persistent path survives reboot */
-#if defined(HYBRIS_DEBUG_LOG)
-    {
-        int dbgfd = open("/data/hybris-debug.log", O_WRONLY|O_CREAT|O_APPEND, 0644);
-        if (dbgfd >= 0) {
-            dprintf(dbgfd, "\n=== hooks.c PID=%d ===\n", getpid());
-            dprintf(dbgfd, "set_host_info=%p linker_init=%p dlopen=%p\n",
-                    _android_linker_set_host_info, _android_linker_init, _android_dlopen);
-        }
+    HYBRIS_WRITE_DEBUG_LOG("\n=== hooks.c PID=%d ===\n", getpid());
+    HYBRIS_WRITE_DEBUG_LOG("set_host_info=%p linker_init=%p dlopen=%p\n",
+            _android_linker_set_host_info, _android_linker_init, _android_dlopen);
 
-        /* Pass host ELF info to q.so so it can build a real soinfo with symbol
-         * tables. Without this, Android 15's ld-android.so trap stubs get called
-         * instead of q.so's __loader_* implementations → SIGSEGV. */
-        if (_android_linker_set_host_info && _android_linker_init) {
-            Dl_info dli;
-            if (dladdr((void*)_android_linker_init, &dli) && dli.dli_fbase) {
-                ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)dli.dli_fbase;
-                if (ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
-                    ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
-                    ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
-                    ehdr->e_ident[EI_MAG3] == ELFMAG3) {
-                    ElfW(Phdr)* phdr = (ElfW(Phdr)*)((uintptr_t)ehdr + ehdr->e_phoff);
-                    ElfW(Half) phnum = ehdr->e_phnum;
-                    ElfW(Addr) base = (ElfW(Addr))ehdr;
-                    ElfW(Addr) load_bias = 0;
-                    for (int i = 0; i < phnum; i++) {
-                        if (phdr[i].p_type == PT_LOAD) {
-                            load_bias = (ElfW(Addr))ehdr + phdr[i].p_offset - phdr[i].p_vaddr;
-                            break;
-                        }
+    /* Pass host ELF info to q.so so it can build a real soinfo with symbol
+     * tables. Without this, Android 15's ld-android.so trap stubs get called
+     * instead of q.so's __loader_* implementations → SIGSEGV. */
+    if (_android_linker_set_host_info && _android_linker_init) {
+        Dl_info dli;
+        if (dladdr((void*)_android_linker_init, &dli) && dli.dli_fbase) {
+            ElfW(Ehdr)* ehdr = (ElfW(Ehdr)*)dli.dli_fbase;
+            if (ehdr->e_ident[EI_MAG0] == ELFMAG0 &&
+                ehdr->e_ident[EI_MAG1] == ELFMAG1 &&
+                ehdr->e_ident[EI_MAG2] == ELFMAG2 &&
+                ehdr->e_ident[EI_MAG3] == ELFMAG3) {
+                ElfW(Phdr)* phdr = (ElfW(Phdr)*)((uintptr_t)ehdr + ehdr->e_phoff);
+                ElfW(Half) phnum = ehdr->e_phnum;
+                ElfW(Addr) base = (ElfW(Addr))ehdr;
+                ElfW(Addr) load_bias = 0;
+                for (int i = 0; i < phnum; i++) {
+                    if (phdr[i].p_type == PT_LOAD) {
+                        load_bias = (ElfW(Addr))ehdr + phdr[i].p_offset - phdr[i].p_vaddr;
+                        break;
                     }
-                    if (dbgfd >= 0) {
-                        dprintf(dbgfd, "calling set_host_info base=%p phnum=%d bias=%p\n",
-                                (void*)base, phnum, (void*)load_bias);
-                    }
-                    _android_linker_set_host_info(base, phdr, phnum, load_bias);
-                    if (dbgfd >= 0)
-                        dprintf(dbgfd, "set_host_info OK\n");
-                } else {
-                    if (dbgfd >= 0)
-                        dprintf(dbgfd, "ERROR: dli_fbase not valid ELF\n");
                 }
+                HYBRIS_WRITE_DEBUG_LOG("calling set_host_info base=%p phnum=%d bias=%p\n",
+                        (void*)base, phnum, (void*)load_bias);
+                _android_linker_set_host_info(base, phdr, phnum, load_bias);
+                HYBRIS_WRITE_DEBUG_LOG("set_host_info OK\n");
             } else {
-                if (dbgfd >= 0)
-                    dprintf(dbgfd, "ERROR: dladdr failed\n");
+                HYBRIS_WRITE_DEBUG_LOG("ERROR: dli_fbase not valid ELF\n");
             }
         } else {
-            if (dbgfd >= 0)
-                dprintf(dbgfd, "SKIP: set_host_info=%p init=%p\n",
-                        _android_linker_set_host_info, _android_linker_init);
+            HYBRIS_WRITE_DEBUG_LOG("ERROR: dladdr failed\n");
         }
-        if (dbgfd >= 0) {
-            dprintf(dbgfd, "about to call _android_linker_init sdk=%d\n", sdk_version);
-            fsync(dbgfd);
-            close(dbgfd);
-        }
+    } else {
+        HYBRIS_WRITE_DEBUG_LOG("SKIP: set_host_info=%p init=%p\n",
+                _android_linker_set_host_info, _android_linker_init);
     }
+    HYBRIS_WRITE_DEBUG_LOG("about to call _android_linker_init sdk=%d\n", sdk_version);
 #endif
     /* Now its time to setup the linker itself */
 #ifdef WANT_ARM_TRACING
