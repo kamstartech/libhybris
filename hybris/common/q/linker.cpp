@@ -1152,14 +1152,6 @@ static int open_library_on_paths(ZipArchiveCache* zip_archive_cache,
                                  const std::vector<std::string>& paths,
                                  std::string* realpath) {
   for (const auto& path : paths) {
-    // In Android Q+ the bootstrap libdl.so is a stub that lacks CFI helpers
-    // such as __cfi_init.  When running under hybris we must load the real
-    // /system/lib64/libdl.so, otherwise CFI shadow initialization fails.
-    if (strcmp(name, "libdl.so") == 0 &&
-        path.size() >= 10 && path.rfind("/bootstrap") == path.size() - 10) {
-      continue;
-    }
-
     char buf[512];
     if (!format_path(buf, sizeof(buf), path.c_str(), name)) {
       continue;

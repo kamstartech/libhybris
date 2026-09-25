@@ -78,6 +78,12 @@ int HWCNativeBufferGetFence(struct ANativeWindowBuffer *buf);
  */
 void HWCNativeBufferSetFence(struct ANativeWindowBuffer *buf, int fd);
 
+/** Set the number of buffers associated with a HWC ANativeWindow.
+ *
+ * \sa HWCNativeWindowCreate
+ */
+void HWCNativeWindowSetBufferCount(struct ANativeWindow *window, int count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -59,7 +59,12 @@ enum uapi_version {
     UAPI_MODERN,
     UAPI_LEGACY
 };
-static atomic_int g_uapi_version = ATOMIC_VAR_INIT(UAPI_UNKNOWN);
+/* ATOMIC_VAR_INIT() was always just its argument (C11 7.17.2) -- deprecated
+ * in C17, removed in C23. Newer toolchains (confirmed live 2026-09-25,
+ * building kali: GCC with C++ headers under /usr/include/c++/16) no longer
+ * declare it at all ("implicit declaration of function 'ATOMIC_VAR_INIT'").
+ * Plain assignment is the portable equivalent on every C11+ compiler. */
+static atomic_int g_uapi_version = UAPI_UNKNOWN;
 
 /* Legacy Sync API */
 
